@@ -5,10 +5,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <stdio.h>
-#include <semaphore.h>
-
-sem_t *g_course_sem = NULL;
-sem_t *course_update_sem = NULL;
+#include <fcntl.h>
+#include "session_utils.h"
 
 // Stub: check credentials (replace with file-based check later)
 int check_user(const char *name, const char *password, UserRole *role, int *user_id) {
@@ -81,64 +79,7 @@ void handle_admin_requests(int client_fd) {
                 snprintf(resp.message, MAX_LINE, "User not found or already deleted.");
             }
             write(client_fd, &resp, sizeof(GenericResponse));
-        } else if (msg_type == MSG_CONSISTENCY_CHECK) {
-            GenericResponse resp = {0};
-            int fixed = 0, total = 0;
-            // Scan enrollments and remove invalid ones
-            int fd = open(ENROLLMENT_FILE, O_RDWR);
-            if (fd >= 0) {
-                lock_file(fd, F_WRLCK);
-                Enrollment enr;
-                ssize_t pos = 0;
-                while (safe_read(fd, &enr, sizeof(Enrollment)) == sizeof(Enrollment)) {
-                    total++;
-                    // Check student
-                    User user;
-                    int user_ok = (find_user_by_id(enr.student_id, &user) == 0 && user.active == 1 && user.role == ROLE_STUDENT);
-                    // Check course
-                    Course course;
-                    int course_ok = (find_course_by_id(enr.course_id, &course) == 0 && course.seats > 0);
-                    if (!user_ok || !course_ok) {
-                        Enrollment blank = {-1, -1};
-                        lseek(fd, pos, SEEK_SET);
-                        safe_write(fd, &blank, sizeof(Enrollment));
-                        fixed++;
-                    }
-                    pos += sizeof(Enrollment);
-                }
-                unlock_file(fd);
-                close(fd);
-            }
-            snprintf(resp.message, MAX_LINE, "Consistency check done. %d/%d invalid enrollments removed.", fixed, total);
-            resp.success = 1;
-            write(client_fd, &resp, sizeof(GenericResponse));
-            log_action("Admin ran consistency check: %d/%d invalid enrollments removed", fixed, total);
-        } else if (msg_type == MSG_PURGE_DELETED_USERS) {
-            GenericResponse resp = {0};
-            int count = 0, kept = 0;
-            FILE *fin = fopen(USER_FILE, "rb");
-            FILE *fout = fopen("users.tmp", "wb");
-            if (fin && fout) {
-                User user;
-                while (fread(&user, sizeof(User), 1, fin) == 1) {
-                    count++;
-                    if (user.active != -1) {
-                        fwrite(&user, sizeof(User), 1, fout);
-                        kept++;
-                    }
-                }
-                fclose(fin);
-                fclose(fout);
-                remove(USER_FILE);
-                rename("users.tmp", USER_FILE);
-                snprintf(resp.message, MAX_LINE, "Purge complete. %d deleted users removed, %d kept.", count - kept, kept);
-                resp.success = 1;
-                log_action("Admin purged deleted users: %d removed, %d kept", count - kept, kept);
-            } else {
-                snprintf(resp.message, MAX_LINE, "Failed to purge deleted users.");
-                resp.success = 0;
-            }
-            write(client_fd, &resp, sizeof(GenericResponse));
+        
         } else {
             break;
         }
@@ -188,24 +129,34 @@ void handle_student_requests(int client_fd, int student_id) {
             }
         } else if (msg_type == MSG_LIST_COURSES) {
             int fid;
-            read(client_fd, &fid, sizeof(int)); // should be -1 for all courses
+            read(client_fd, &fid, sizeof(int));
             Course courses[MAX_COURSES];
             int count = 0;
             int fd = open(COURSE_FILE, O_RDONLY);
             if (fd >= 0) {
                 lock_file(fd, F_RDLCK);
                 Course course;
+                int entry = 0;
                 while (safe_read(fd, &course, sizeof(Course)) == sizeof(Course)) {
-                    if (course.seats > 0 && course.id > 0 && course.name[0] != '\0') {
+                    if ((fid == -1 && course.seats > 0 && course.id > 0 && course.name[0] != '\0') ||
+                        (course.faculty_id == fid && course.seats > 0 && course.id > 0 && course.name[0] != '\0')) {
                         courses[count++] = course;
                     }
+                    entry++;
                 }
                 unlock_file(fd);
                 close(fd);
+                fprintf(stderr, "[SERVER] Read %d entries from courses.dat, sending %d valid courses to client\n", entry, count);
+            } else {
+                fprintf(stderr, "[SERVER] Could not open courses.dat for reading\n");
             }
-            write(client_fd, &count, sizeof(int));
+            if (write(client_fd, &count, sizeof(int)) != sizeof(int)) {
+                fprintf(stderr, "[SERVER] Error writing course count to client\n");
+            }
             for (int i = 0; i < count; ++i) {
-                write(client_fd, &courses[i], sizeof(Course));
+                if (write(client_fd, &courses[i], sizeof(Course)) != sizeof(Course)) {
+                    fprintf(stderr, "[SERVER] Error writing course data to client (i=%d)\n", i);
+                }
             }
         } else if (msg_type == MSG_CHANGE_PASSWORD) {
             UserRequest req;
@@ -230,14 +181,56 @@ void handle_student_requests(int client_fd, int student_id) {
 
 // Handles faculty requests (add/update/remove courses, view enrollments, change password)
 void handle_faculty_requests(int client_fd, int faculty_id) {
+    printf("[SERVER DEBUG] handle_faculty_requests CALLED for faculty_id=%d\n", faculty_id);
+    fflush(stdout);
     int msg_type;
     while (read(client_fd, &msg_type, sizeof(int)) > 0) {
         if (msg_type == MSG_ADD_COURSE) {
+            printf("[SERVER DEBUG] Entered MSG_ADD_COURSE block\n");
+            fflush(stdout);
             CourseRequest req;
             read(client_fd, &req, sizeof(CourseRequest));
+            printf("[SERVER DEBUG] Read CourseRequest from client\n");
+            fflush(stdout);
+            int fd = open(COURSE_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd < 0) {
+                printf("[SERVER DEBUG] Failed to open course file\n");
+                fflush(stdout);
+                GenericResponse resp = {0};
+                resp.success = 0;
+                snprintf(resp.message, MAX_LINE, "Failed to open course file.");
+                write(client_fd, &resp, sizeof(GenericResponse));
+                return;
+            }
+            printf("[SERVER DEBUG] Opened course file, about to lock\n");
+            fflush(stdout);
+            struct flock fl;
+            fl.l_type = F_WRLCK;
+            fl.l_whence = SEEK_SET;
+            fl.l_start = 0;
+            fl.l_len = 0;
+            int lock_result = fcntl(fd, F_SETLK, &fl); // Non-blocking
+            if (lock_result == -1) {
+                printf("[SERVER] Faculty %d cannot access because course file is locked\n", faculty_id);
+                fflush(stdout);
+                GenericResponse resp = {0};
+                resp.success = 0;
+                snprintf(resp.message, MAX_LINE, "Course file is currently locked by another operation. Please try again later.");
+                write(client_fd, &resp, sizeof(GenericResponse));
+                close(fd);
+                continue;
+            }
+            GenericResponse lock_resp = {1, "fILE LOCK on course file acquired"};
+            write(client_fd, &lock_resp, sizeof(GenericResponse));
+            sleep(8); // Simulate long-running operation for demo
+            ssize_t written = safe_write(fd, &req.course, sizeof(Course));
+            unlock_file(fd);
+            close(fd);
             GenericResponse resp = {0};
-            if (add_course(&req.course) == 0) {
+            if (written == sizeof(Course)) {
                 resp.success = 1;
+                printf("[SERVER] Course added successfully!\n");
+                fflush(stdout);
                 snprintf(resp.message, MAX_LINE, "Course added successfully!");
             } else {
                 resp.success = 0;
@@ -245,15 +238,56 @@ void handle_faculty_requests(int client_fd, int faculty_id) {
             }
             write(client_fd, &resp, sizeof(GenericResponse));
         } else if (msg_type == MSG_UPDATE_COURSE) {
+            printf("[SERVER DEBUG] Received MSG_UPDATE_COURSE request\n");
+            fflush(stdout);
             CourseRequest req;
             read(client_fd, &req, sizeof(CourseRequest));
+            printf("[SERVER DEBUG] Read CourseRequest from client\n");
+            fflush(stdout);
+            int fd = open(COURSE_FILE, O_RDWR);
+            if (fd < 0) {
+                printf("[SERVER DEBUG] Failed to open course file\n");
+                fflush(stdout);
+                GenericResponse resp = {0};
+                resp.success = 0;
+                snprintf(resp.message, MAX_LINE, "Failed to open course file.");
+                write(client_fd, &resp, sizeof(GenericResponse));
+                return;
+            }
+            printf("[SERVER DEBUG] Opened course file, about to lock\n");
+            fflush(stdout);
+            int lock_result = lock_file(fd, F_WRLCK);
+            printf("[SERVER DEBUG] lock_file returned %d\n", lock_result);
+            fflush(stdout);
+            if (lock_result == 0) {
+                printf("[SERVER] fILE LOCK on course file acquired for UPDATE_COURSE (lock_file returned 0)\n");
+                fflush(stdout);
+            } else {
+                printf("[SERVER] lock_file failed for UPDATE_COURSE, return value: %d\n", lock_result);
+                fflush(stdout);
+            }
+            GenericResponse lock_resp = {1, "fILE LOCK on course file acquired"};
+            write(client_fd, &lock_resp, sizeof(GenericResponse));
+            printf("[SERVER DEBUG] Sent lock acquired message to client\n");
+            fflush(stdout);
             GenericResponse resp = {0};
             Course course;
             if (find_course_by_id(req.course.id, &course) == 0 && course.faculty_id == faculty_id) {
                 if (req.course.name[0] != '\0') strncpy(course.name, req.course.name, MAX_NAME_LEN);
                 if (req.course.seats > 0) course.seats = req.course.seats;
                 else if (req.course.seats == 0 && req.course.name[0] == '\0') course.seats = 0;
-                update_course(&course);
+                // Write the updated course back to the file
+                Course temp;
+                ssize_t pos = 0;
+                lseek(fd, 0, SEEK_SET);
+                while (safe_read(fd, &temp, sizeof(Course)) == sizeof(Course)) {
+                    if (temp.id == course.id) {
+                        lseek(fd, pos, SEEK_SET);
+                        safe_write(fd, &course, sizeof(Course));
+                        break;
+                    }
+                    pos += sizeof(Course);
+                }
                 resp.success = 1;
                 if (req.course.seats == 0 && req.course.name[0] == '\0')
                     snprintf(resp.message, MAX_LINE, "Course removed (marked as unavailable).");
@@ -263,43 +297,44 @@ void handle_faculty_requests(int client_fd, int faculty_id) {
                 resp.success = 0;
                 snprintf(resp.message, MAX_LINE, "Course not found or not owned by you.");
             }
+            unlock_file(fd);
+            printf("[SERVER DEBUG] Unlocked file\n");
+            fflush(stdout);
+            close(fd);
+            printf("[SERVER DEBUG] Closed file\n");
+            fflush(stdout);
             write(client_fd, &resp, sizeof(GenericResponse));
+            printf("[SERVER DEBUG] Sent final response to client\n");
+            fflush(stdout);
         } else if (msg_type == MSG_LIST_COURSES) {
             int fid;
             read(client_fd, &fid, sizeof(int));
             Course courses[MAX_COURSES];
             int count = 0;
-            if (sem_trywait(course_update_sem) != 0) {
-                // Could not acquire lock, send error
-                count = -1;
-                write(client_fd, &count, sizeof(int));
+            int fd = open(COURSE_FILE, O_RDONLY);
+            if (fd >= 0) {
+                lock_file(fd, F_RDLCK);
+                Course course;
+                int entry = 0;
+                while (safe_read(fd, &course, sizeof(Course)) == sizeof(Course)) {
+                    if ((fid == -1 && course.seats > 0 && course.id > 0 && course.name[0] != '\0') ||
+                        (course.faculty_id == fid && course.seats > 0 && course.id > 0 && course.name[0] != '\0')) {
+                        courses[count++] = course;
+                    }
+                    entry++;
+                }
+                unlock_file(fd);
+                close(fd);
+                fprintf(stderr, "[SERVER] Read %d entries from courses.dat, sending %d valid courses to client\n", entry, count);
             } else {
-                int fd = open(COURSE_FILE, O_RDONLY);
-                if (fd >= 0) {
-                    lock_file(fd, F_RDLCK);
-                    Course course;
-                    int entry = 0;
-                    while (safe_read(fd, &course, sizeof(Course)) == sizeof(Course)) {
-                        if ((fid == -1 && course.seats > 0 && course.id > 0 && course.name[0] != '\0') ||
-                            (course.faculty_id == fid && course.seats > 0 && course.id > 0 && course.name[0] != '\0')) {
-                            courses[count++] = course;
-                        }
-                        entry++;
-                    }
-                    unlock_file(fd);
-                    close(fd);
-                    fprintf(stderr, "[SERVER] Read %d entries from courses.dat, sending %d valid courses to client\n", entry, count);
-                } else {
-                    fprintf(stderr, "[SERVER] Could not open courses.dat for reading\n");
-                }
-                sem_post(course_update_sem);
-                if (write(client_fd, &count, sizeof(int)) != sizeof(int)) {
-                    fprintf(stderr, "[SERVER] Error writing course count to client\n");
-                }
-                for (int i = 0; i < count; ++i) {
-                    if (write(client_fd, &courses[i], sizeof(Course)) != sizeof(Course)) {
-                        fprintf(stderr, "[SERVER] Error writing course data to client (i=%d)\n", i);
-                    }
+                fprintf(stderr, "[SERVER] Could not open courses.dat for reading\n");
+            }
+            if (write(client_fd, &count, sizeof(int)) != sizeof(int)) {
+                fprintf(stderr, "[SERVER] Error writing course count to client\n");
+            }
+            for (int i = 0; i < count; ++i) {
+                if (write(client_fd, &courses[i], sizeof(Course)) != sizeof(Course)) {
+                    fprintf(stderr, "[SERVER] Error writing course data to client (i=%d)\n", i);
                 }
             }
         } else if (msg_type == MSG_LIST_STUDENTS_IN_COURSE) {
@@ -356,14 +391,25 @@ void handle_faculty_requests(int client_fd, int faculty_id) {
 // Server entry point and client handler for Academia Portal
 void handle_client(int client_fd) {
     int msg_type;
+    int user_id = -1;
+    UserRole role;
+    int logged_in = 0;
     read(client_fd, &msg_type, sizeof(int));
     if (msg_type == MSG_LOGIN_REQUEST) {
         LoginRequest req;
         read(client_fd, &req, sizeof(LoginRequest));
         LoginResponse resp = {0};
-        UserRole role;
-        int user_id;
         if (check_user(req.name, req.password, &role, &user_id)) {
+            // Session management: disallow multiple logins
+            if (is_user_logged_in(user_id)) {
+                resp.success = 0;
+                snprintf(resp.message, MAX_LINE, "User already logged in elsewhere.");
+                write(client_fd, &resp, sizeof(LoginResponse));
+                close(client_fd);
+                return;
+            }
+            add_active_session(user_id);
+            logged_in = 1;
             resp.success = 1;
             resp.role = role;
             resp.user_id = user_id;
@@ -382,13 +428,14 @@ void handle_client(int client_fd) {
             write(client_fd, &resp, sizeof(LoginResponse));
         }
     }
+    if (logged_in && user_id != -1) {
+        remove_active_session(user_id);
+    }
     close(client_fd);
 }
 
 // Main server loop: accepts clients and forks child processes
 int main() {
-    g_course_sem = init_semaphore("/course_sem", 1);
-    course_update_sem = sem_open("/course_update_sem", O_CREAT, 0666, 1);
     int server_fd = create_server_socket();
     printf("Server started. Waiting for clients...\n");
     while (1) {
@@ -406,8 +453,5 @@ int main() {
         }
     }
     close(server_fd);
-    destroy_semaphore("/course_sem", g_course_sem);
-    sem_close(course_update_sem);
-    sem_unlink("/course_update_sem");
     return 0;
 } 

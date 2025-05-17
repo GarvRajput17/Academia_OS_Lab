@@ -10,12 +10,51 @@ void send_course_request(int sock, int msg_type, Course *course) {
     CourseRequest req = {0};
     req.course = *course;
     write(sock, &req, sizeof(CourseRequest));
+    // Read lock acquired message or lock error
     GenericResponse resp;
     read(sock, &resp, sizeof(GenericResponse));
+    if (resp.success == 0 && strstr(resp.message, "locked by another operation") != NULL) {
+        printf("%s\n", resp.message);
+        return;
+    }
+    if (resp.success == 1 && strcmp(resp.message, "fILE LOCK on course file acquired") == 0) {
+        // Optionally print this, or just proceed silently
+    }
+    // Read final result
+    read(sock, &resp, sizeof(GenericResponse));
     printf("%s\n", resp.message);
+    if (resp.success == 2) { // Server is prompting for confirmation
+        printf("%s ", resp.message);
+        char confirm = getchar();
+        getchar(); // consume newline
+        write(sock, &confirm, sizeof(char));
+        read(sock, &resp, sizeof(GenericResponse));
+        printf("%s\n", resp.message);
+    }
 }
 
-// Prompt and send add course request
+// Helper to begin add course lock, returns 1 if lock acquired, 0 otherwise
+int begin_add_course_lock(int sock) {
+    int msg_type = MSG_ADD_COURSE_BEGIN;
+    write(sock, &msg_type, sizeof(int));
+    GenericResponse resp;
+    read(sock, &resp, sizeof(GenericResponse));
+    if (!resp.success) {
+        printf("%s\n", resp.message);
+        return 0;
+    }
+    return 1;
+}
+
+// Helper to end add course lock
+void end_add_course_lock(int sock) {
+    int msg_type = MSG_ADD_COURSE_END;
+    write(sock, &msg_type, sizeof(int));
+    GenericResponse resp;
+    read(sock, &resp, sizeof(GenericResponse));
+}
+
+// Prompt and send add course request (with lock protocol)
 void add_course_prompt(int sock, int faculty_id) {
     Course course = {0};
     printf("Enter Course ID: ");
@@ -29,6 +68,7 @@ void add_course_prompt(int sock, int faculty_id) {
     scanf("%d", &course.seats);
     getchar();
     course.enrolled = 0;
+    printf("\nYou entered:\n  ID: %d\n  Name: %s\n  Seats: %d\n", course.id, course.name, course.seats);
     send_course_request(sock, MSG_ADD_COURSE, &course);
 }
 

@@ -4,11 +4,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#ifndef STUDENT_H
-#define STUDENT_H
-void student_menu(int sock, int student_id);
-#endif
-
 // Student client menu and actions for Academia Portal
 void send_enroll_request(int sock, int msg_type, int student_id, int course_id) {
     write(sock, &msg_type, sizeof(int));
@@ -80,6 +75,11 @@ void view_all_courses(int sock) {
     int count;
     if (read(sock, &count, sizeof(int)) != sizeof(int)) {
         perror("Error reading course count");
+        return;
+    }
+
+    if (count == -1) {
+        printf("Course file is currently being updated. Please try again later.\n");
         return;
     }
 

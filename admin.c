@@ -85,13 +85,6 @@ void delete_user_prompt(int sock) {
     read(sock, &resp, sizeof(GenericResponse));
 }
 
-void run_consistency_check(int sock) {
-    write(sock, &(int){MSG_CONSISTENCY_CHECK}, sizeof(int));
-    GenericResponse resp;
-    read(sock, &resp, sizeof(GenericResponse));
-    printf("%s\n", resp.message);
-}
-
 void change_admin_password(int sock) {
     write(sock, &(int){MSG_CHANGE_PASSWORD}, sizeof(int));
     UserRequest req = {0};
@@ -155,8 +148,7 @@ void admin_menu(int sock) {
         printf("6. Activate Student\n");
         printf("7. Delete User\n");
         printf("8. Change Admin Password\n");
-        printf("9. Run Consistency Check\n");
-        printf("10. Exit\n");
+        printf("9. Exit\n");
         printf("Enter choice: ");
         scanf("%d", &choice);
         getchar();
@@ -186,9 +178,6 @@ void admin_menu(int sock) {
                 change_admin_password(sock);
                 break;
             case 9:
-                run_consistency_check(sock);
-                break;
-            case 10:
                 return;
             default:
                 printf("Invalid choice.\n");

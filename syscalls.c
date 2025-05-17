@@ -4,13 +4,8 @@
 #include <sys/sem.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <semaphore.h>
 #include <stdarg.h>
 #include <time.h>
-
-#ifdef SERVER_BUILD
-extern sem_t *g_course_sem;
-#endif
 
 int lock_file(int fd, int type) {
     struct flock fl;
@@ -138,6 +133,7 @@ int update_course(const Course *course) {
     int fd = open(COURSE_FILE, O_RDWR);
     if (fd < 0) return -1;
     lock_file(fd, F_WRLCK);
+    printf("fILE LOCK on course file acquired\n");
     Course temp;
     ssize_t pos = 0;
     while (safe_read(fd, &temp, sizeof(Course)) == sizeof(Course)) {
@@ -192,30 +188,18 @@ int find_course_by_name(const char *name, Course *course_out) {
 }
 
 int enroll_student(int student_id, int course_id) {
-#ifdef SERVER_BUILD
-    posix_sem_wait(g_course_sem);
-#endif
     // Check if already enrolled
     if (is_student_enrolled(student_id, course_id)) {
-#ifdef SERVER_BUILD
-        posix_sem_signal(g_course_sem);
-#endif
         return -1;
     }
     // Check course seat availability
     Course course;
     if (find_course_by_id(course_id, &course) != 0 || course.enrolled >= course.seats) {
-#ifdef SERVER_BUILD
-        posix_sem_signal(g_course_sem);
-#endif
         return -2;
     }
     // Add enrollment
     int fd = open(ENROLLMENT_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) {
-#ifdef SERVER_BUILD
-        posix_sem_signal(g_course_sem);
-#endif
         return -1;
     }
     lock_file(fd, F_WRLCK);
@@ -226,9 +210,6 @@ int enroll_student(int student_id, int course_id) {
     // Update course enrolled count
     course.enrolled++;
     update_course(&course);
-#ifdef SERVER_BUILD
-    posix_sem_signal(g_course_sem);
-#endif
     return (written == sizeof(Enrollment)) ? 0 : -1;
 }
 
@@ -300,25 +281,6 @@ int list_enrolled_courses(int student_id, Course *courses, int max_courses) {
     unlock_file(fd);
     close(fd);
     return count;
-}
-
-// POSIX semaphore helpers
-sem_t *init_semaphore(const char *name, int initial_value) {
-    sem_t *sem = sem_open(name, O_CREAT, 0666, initial_value);
-    return sem;
-}
-
-void destroy_semaphore(const char *name, sem_t *sem) {
-    sem_close(sem);
-    sem_unlink(name);
-}
-
-void posix_sem_wait(sem_t *sem) {
-    sem_wait(sem);
-}
-
-void posix_sem_signal(sem_t *sem) {
-    sem_post(sem);
 }
 
 void log_action(const char *fmt, ...) {
